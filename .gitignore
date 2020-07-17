@@ -1,0 +1,9 @@
+data/raw
+data/processed/learn_202001.csv
+data/processed/subject_IDs.csv
+data/processed/test_201909.csv
+
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata

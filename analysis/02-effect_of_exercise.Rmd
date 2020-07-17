@@ -1,0 +1,850 @@
+---
+title: "Does high-intensity physical exercise affect memorisation?"
+author: "Maarten van der Velde"
+date: "Last updated: `r Sys.time()`"
+output:
+  html_notebook:
+    smart: no
+    toc: yes
+    toc_float: yes
+  html_document:
+    df_print: paged
+    toc: yes
+    toc_float: yes
+---
+
+# Overview
+
+This notebook investigates the effect of high-intensity physical exercise on memorisation.
+We collected data from trainees in the Dutch Special Forces recruitment program.
+Trainees were subjected to a mix of physical and cognitive tasks.
+Here, we focus on performance in a set of learning tasks that were separated by a high-intensity speed march.
+
+
+# Setup
+
+## Load packages
+```{r}
+library(brms)
+library(dplyr)
+library(forcats)
+library(furrr)
+library(ggplot2)
+library(ggResidpanel)
+library(ggforce)
+library(grid)
+library(RColorBrewer)
+library(itsadug)
+library(lme4)
+library(mgcv)
+library(purrr)
+library(readr)
+library(tidyr)
+library(extrafont)
+loadfonts(quiet = TRUE)
+
+theme_set(theme_bw(base_size = 14))
+
+theme_poster <- theme_light(base_size = 18) +
+            theme(text = element_text(family = "Merriweather Sans", colour = "black"),
+                  strip.text = element_text(colour = "black"),
+                  plot.title = element_text(size = 14, hjust = 0.5),
+                  axis.title = element_text(size = 14),
+                  rect = element_rect(fill = "transparent"),
+                  plot.background = element_rect(fill = "transparent", color = NA)
+                  ) 
+
+colours_custom <- c("#00bfa5", "#028bb3")
+colours_custom <- c("#1b9e77", "#7570b3")
+```
+
+
+## Load data
+
+```{r}
+d_full <- read_csv(file.path("..", "data", "processed", "learn_201909.csv"), col_types = cols(
+  subject = col_character(),
+  list = col_character(),
+  city = col_character(),
+  trial_index = col_double(),
+  start_time = col_double(),
+  time_elapsed = col_double(),
+  rt = col_double(),
+  presentation_start_time = col_double(),
+  id = col_character(),
+  text = col_logical(),
+  response = col_character(),
+  answer = col_character(),
+  choices = col_character(),
+  correct = col_logical(),
+  study = col_logical(),
+  date = col_datetime(format = "")
+))
+```
+
+
+## Subset data
+
+Participants did three learning sessions; we're only interested in the second and the third.
+To be included in the analysis, participants should have completed both of these sessions exactly once.
+```{r}
+valid_subj <- d_full %>%
+  filter(list %in% c("201909_2", "201909_3")) %>%
+  group_by(subject, list) %>%
+  tally(trial_index == 3) %>% # First trial only happens once per session. Value greater than one indicates that same list was repeated.
+  ungroup() %>%
+  complete(subject, list) %>%
+  filter(n == 1) %>%
+  group_by(subject) %>%
+  filter(sum(n) == 2) %>%
+  ungroup() %>%
+  select(-n)
+
+d <- right_join(d_full, valid_subj, by = c("subject", "list")) %>%
+  mutate(list = ifelse(list == "201909_2", "before", "after")) %>%
+  group_by(subject, list, id) %>%
+  mutate(presentation = 1:n()) %>%
+  ungroup() %>%
+  mutate(list = as.factor(list),
+         list = fct_rev(list))
+```
+
+How many participants are included in the analysis?
+```{r}
+length(unique(d$subject))
+```
+
+
+# Session statistics
+
+```{r}
+session_stats <- d %>% 
+  group_by(subject, list) %>%
+  summarise(city = city[1],
+            n_trials = n(),
+            n_items = length(unique(id)),
+            accuracy = mean(correct),
+            rt = median(rt)) %>%
+  ungroup()
+
+session_stats$list_jittered <- jitter(as.numeric(session_stats$list, amount = 0))
+```
+
+
+## Stimulus allocation
+Each learning session contained items from a single city.
+The allocation of cities to sessions was randomised, but ensured that participants never saw the same city twice.
+How many participants studied each city in either session?
+```{r}
+session_stats %>%
+  count(list, city) %>%
+  spread(list, n)
+```
+
+## Number of trials
+Sessions lasted 8 minutes, but depending on response speed and accuracy participants could complete more or fewer trials.
+The number of trials completed is similar for each of the three cities (collapsed over both sessions), suggesting that they were about equally difficult.
+```{r}
+ggplot(session_stats, aes(x = city, y = n_trials)) +
+  geom_violin() +
+  geom_jitter(height = 0, width = 0.1, alpha = 0.5, aes(colour = city)) +
+  geom_boxplot(width = 0.2, fill = NA, outlier.shape = NA) +
+  guides(colour = FALSE) +
+  labs(x = "City",
+       y = "Number of trials") +
+  coord_flip()
+```
+
+
+The number of trials seems like it may have increased slightly from session 2 (pre-march) to session 3 (post-march).
+```{r}
+ggplot(session_stats, aes(x = list, y = n_trials)) +
+  geom_violin(colour = NA, fill = NA) +
+  geom_point(aes(x = list_jittered, colour = list)) +
+  geom_line(aes(x = list_jittered, group = subject), alpha = 0.2) +
+  geom_boxplot(width = 0.2, fill = NA, outlier.shape = NA, lwd = 1) +
+  guides(colour = FALSE) +
+  scale_colour_manual(values = colours_custom) +
+  labs(x = NULL, y = NULL, title = "Trials") +
+  theme_poster
+
+ggsave("../output/num_trials.pdf", device = "pdf", width = 3, height = 3)
+```
+
+
+
+Is there a within-subject increase in the number of trials?
+
+Including a random intercept for city results in a singular fit:
+```{r}
+m_ntrials <- lmer(n_trials ~ list + (1 | subject) + (1 | city), data = session_stats)
+
+summary(m_ntrials)
+```
+
+Without random intercept for city:
+```{r}
+m_ntrials2 <- lmer(n_trials ~ list + (1 | subject), data = session_stats)
+
+summary(m_ntrials2)
+```
+
+Comparison to a model without an effect of session shows that we should include it:
+```{r}
+m_ntrials3 <- lmer(n_trials ~ (1 | subject), data = session_stats)
+
+summary(m_ntrials3)
+
+anova(m_ntrials2, m_ntrials3)
+```
+
+This model shows that participants completed about 6 trials more in the post-march session than in the pre-march session.
+
+
+
+## Number of distinct facts
+The adaptive learning system only introduces a new fact when it thinks all current facts have sufficiently high activation to not be forgotten in the next 15 seconds.
+This means that the better a participant is at memorising, and/or the easier the material, the more distinct facts will be presented during a session.
+
+The number of distinct facts seen by participants look similar across all three cities, though perhaps slightly lower for Baghdad.
+```{r}
+ggplot(session_stats, aes(x = city, y = n_items)) +
+  geom_violin() +
+  geom_jitter(height = 0, width = 0.1, alpha = 0.5, aes(colour = city)) +
+  geom_boxplot(width = 0.2, fill = NA, outlier.shape = NA) +
+  guides(colour = FALSE) +
+  labs(x = "City",
+       y = "Number of distinct facts (max = 30)") +
+  coord_flip()
+```
+
+
+The number of distinct facts also seems to increase slightly pre-march to post-march.
+```{r}
+ggplot(session_stats, aes(x = list, y = n_items)) +
+  geom_violin(colour = NA, fill = NA) +
+  geom_point(aes(x = list_jittered, colour = list)) +
+  geom_line(aes(x = list_jittered, group = subject), alpha = 0.2) +
+  geom_boxplot(width = 0.2, fill = NA, outlier.shape = NA, lwd = 1) +
+  guides(colour = FALSE) +
+  scale_colour_manual(values = colours_custom) +
+  labs(x = NULL, y = NULL, title = "Safehouses") +
+  theme_poster
+
+ggsave("../output/num_facts.pdf", device = "pdf", width = 3, height = 3)
+```
+
+
+Including a random intercept for city results in a singular fit.
+```{r}
+m_nfacts <- lmer(n_items ~ list + (1 | subject) + (1 | city), data = session_stats)
+
+summary(m_nfacts)
+```
+
+Without random intercept for city:
+```{r}
+m_nfacts2 <- lmer(n_items ~ list + (1 | subject), data = session_stats)
+
+summary(m_nfacts2)
+```
+
+Comparison to a model without an effect of session shows that we should include it:
+```{r}
+m_nfacts3 <- lmer(n_items ~ (1 | subject), data = session_stats)
+
+summary(m_nfacts3)
+
+anova(m_nfacts2, m_nfacts3)
+```
+
+This model shows that participants encountered about 1.5 more facts in the post-march session than in the pre-march session.
+
+
+
+## Response accuracy
+
+All questions were 4-alternative multiple-choice with a single correct answer.
+Trials on which no response was made within 30 seconds of trial onset were marked as incorrect.
+
+Response accuracy looks very similar across all three cities.
+```{r}
+ggplot(session_stats, aes(x = city, y = accuracy)) +
+  geom_violin() +
+  geom_jitter(height = 0, width = 0.1, alpha = 0.5, aes(colour = city)) +
+  geom_boxplot(width = 0.2, fill = NA, outlier.shape = NA) +
+  guides(colour = FALSE) +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(x = "City",
+       y = "Response accuracy") +
+  coord_flip()
+```
+
+Response accuracy also seems to be the same before and after the speed march. 
+```{r}
+ggplot(session_stats, aes(x = list, y = accuracy)) +
+  geom_violin() +
+  geom_jitter(height = 0, width = 0.1, alpha = 0.5, aes(colour = list)) +
+  geom_boxplot(width = 0.2, fill = NA, outlier.shape = NA) +
+  guides(colour = FALSE) +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(x = "Session",
+       y = "Response accuracy") +
+  coord_flip()
+```
+
+Including a random intercept for city results in a failure to converge:
+```{r}
+m_acc <- lmer(accuracy ~ list + (1 | subject) + (1 | city), data = session_stats)
+
+summary(m_acc)
+```
+
+Without random intercept for city:
+```{r}
+m_acc2 <- lmer(accuracy ~ list + (1 | subject), data = session_stats)
+
+summary(m_acc2)
+```
+
+Comparison to a model without an effect of session shows that we don't need to include it:
+```{r}
+m_acc3 <- lmer(accuracy ~ (1 | subject), data = session_stats)
+
+summary(m_acc3)
+
+anova(m_acc2, m_acc3)
+```
+
+In conclusion, there appears to be no difference between the pre-march learning session and the post-march session in terms of overall response accuracy.
+
+
+## Response time
+
+Participants' median response time (on all trials, including study trials and error trials) looks quite similar between lists.
+```{r}
+ggplot(session_stats, aes(x = city, y = rt)) +
+  geom_violin() +
+  geom_jitter(height = 0, width = 0.1, alpha = 0.5, aes(colour = city)) +
+  geom_boxplot(width = 0.2, fill = NA, outlier.shape = NA) +
+  guides(colour = FALSE) +
+  labs(x = "City",
+       y = "Median response time (ms)") +
+  coord_flip()
+```
+
+Response time does seem to decrease after the speed march. 
+```{r}
+ggplot(session_stats, aes(x = list, y = rt)) +
+  geom_violin() +
+  geom_jitter(height = 0, width = 0.1, alpha = 0.5, aes(colour = list)) +
+  geom_boxplot(width = 0.2, fill = NA, outlier.shape = NA) +
+  guides(colour = FALSE) +
+  labs(x = "Session",
+       y = "Median response time (ms)") +
+  coord_flip()
+```
+
+Including a random intercept for city results in a failure to converge:
+```{r}
+m_rt <- lmer(rt ~ list + (1 | subject) + (1 | city), data = session_stats)
+
+summary(m_rt)
+```
+
+Without random intercept for city:
+```{r}
+m_rt2 <- lmer(rt ~ list + (1 | subject), data = session_stats)
+
+summary(m_rt2)
+```
+
+Comparison to a model without an effect of session shows that we should include it:
+```{r}
+m_rt3 <- lmer(rt ~ (1 | subject), data = session_stats)
+
+summary(m_rt3)
+
+anova(m_rt2, m_rt3)
+```
+
+This model shows that responses were about 350 ms faster after the speed march compared to before.
+
+
+
+# Rate of forgetting
+
+```{r}
+source(file.path("99-model_funs.R"))
+
+act <- d %>%
+  transmute(subject,
+            city,
+            fact_id = id,
+            text = "",
+            start_time,
+            rt,
+            correct,
+            threshold = -0.8)
+```
+
+
+Calculate final rate of forgetting estimates for every user/fact pair:
+```{r}
+act_by_subj_and_fact <- split(act, list(act$subject, act$fact_id)) %>%
+  keep(~ nrow(.x) > 0)
+
+alpha <- future_map_dfr(act_by_subj_and_fact, function(x) {
+  x %>%
+    summarise(subject = subject[1],
+              city = city[1],
+              fact_id = fact_id[1],
+              reps = n(),
+              final_alpha = calculate_alpha(max(start_time) + 1, fact_id, 0.3, x))
+})
+```
+
+Compare rate of forgetting measured in the pre-march session to rate of forgetting measured in the post-march session.
+```{r}
+pre_post <- distinct(d, subject, list, city) %>%
+  left_join(alpha, by = c("subject", "city")) %>%
+  filter(reps >= 3) %>%
+  mutate_if(is.character, as.factor)
+```
+
+```{r}
+alpha_by_list <- pre_post %>%
+  group_by(subject, list, city) %>%
+  summarise(mean_alpha = mean(final_alpha)) %>%
+  select(-city) %>%
+  spread(list, mean_alpha)
+```
+
+The plot below compares each subject's pre-march rate of forgetting to their post-march rate of forgetting.
+There is quite a strong correlation between the two measurements.
+There does not appear to be a strong positive or negative effect of the speed march.
+```{r}
+corr_pre_post <- with(alpha_by_list, cor.test(before, after, method = "pearson"))
+
+lims <- c(0.25, 0.55)
+
+ggplot(alpha_by_list, aes(x = after, y = before)) +
+  geom_abline(lty = 2, colour = "grey50") +
+  geom_point() +
+  coord_fixed() +
+  xlim(0.25, 0.55) +
+  ylim(0.25, 0.55) +
+  labs(title = "Rate of forgetting") +
+  theme_poster
+
+ggsave("../output/rof.pdf", device = "pdf", width = 3, height = 3)
+
+```
+
+Make the plot shown on the poster:
+```{r}
+alpha_by_list_long <- alpha_by_list %>%
+  pivot_longer(before:after, names_to = "list", values_to = "rof") %>%
+  mutate(list = fct_rev(list))
+
+alpha_by_list_avg <- alpha_by_list_long %>%
+  group_by(list) %>%
+  summarise(rof = mean(rof))
+
+
+ggplot(alpha_by_list, aes(x = reorder(subject, before), y = before)) +
+  geom_hline(data = alpha_by_list_avg, aes(yintercept = rof, colour = list), lwd = 1.15, alpha = 0.6) +
+  geom_linerange(aes(ymin = before, ymax = after), alpha = 0.2) +
+  geom_point(data = alpha_by_list_long, aes(x = subject, y = rof, colour = list, fill = list)) +
+  scale_colour_manual(values = colours_custom) +
+  scale_fill_manual(values = colours_custom) +
+  ylim(0.299, 0.501) +
+  labs(x = NULL,
+       y = NULL,
+       colour = NULL,
+       fill = NULL,
+       title = "Rate of forgetting change by participant") +
+  theme_poster +
+  theme(legend.position = c(.915,0.15),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        panel.grid.major.x = element_blank())
+
+ggsave("../output/rof_alt.pdf", device = "pdf", width = 7, height = 3.5)
+
+```
+
+A linear mixed-effects regression suggests that there is a very small effect of list on rate of forgetting when controlling for participants and items.
+(Using untransformed rates of forgetting results in non-normal residuals, so using log-transformed rate of forgetting instead.)
+```{r}
+pre_post$final_alpha_log <- log(pre_post$final_alpha)
+
+m_prepost <- lmer(final_alpha_log ~ list + (1 | subject) + (1 | fact_id), data = pre_post)
+
+m_prepost_null <- lmer(final_alpha_log ~ (1 | subject) + (1 | fact_id), data = pre_post)
+
+anova(m_prepost, m_prepost_null)
+
+summary(m_prepost)
+```
+
+```{r}
+resid_panel(m_prepost)
+resid_xpanel(m_prepost)
+```
+
+This model finds that post-march rate of forgetting is a bit lower than the pre-march estimate.
+
+Model predictions (pre-march rate of forgetting, post-march rate of forgetting):
+```{r}
+exp(fixef(m_prepost)[1])
+exp(fixef(m_prepost)[1] + fixef(m_prepost)[2])
+```
+
+
+
+# Within-session trends
+
+## Accuracy
+How does accuracy develop within a session?
+The plot below shows mean response accuracy (+/- 1 SE) over the course of the session, calculated in 10-trial bins.
+Study trials are removed.
+Both sessions show a roughly similar shape: initially accuracy is really high (which is unsurprising: there are many immediate repetitions following study trials) but then it drops before slowly recovering.
+The drop in accuracy seems to be larger in the post-march session, which suggests that participants are less successful at creating a long-term memory representation.
+
+```{r}
+binsize <- 10
+
+d %>%
+  mutate(part = cut(trial_index - 2, seq(0, max(trial_index) + 3, by = binsize), labels = F) * binsize) %>%
+  filter(study == FALSE) %>%
+  group_by(subject, list, part) %>%
+  summarise(accuracy = mean(correct)) %>%
+  group_by(list, part) %>%
+  summarise(acc_se = sd(accuracy)/sqrt(n()),
+            acc = mean(accuracy)) %>%
+  ggplot(aes(x = part, y = acc, group = list, colour = list)) +
+  geom_ribbon(aes(ymin = acc - acc_se, ymax = acc + acc_se, fill = list), alpha = 0.2, colour = NA) +
+  geom_point() +
+  geom_line() +
+  scale_x_continuous(breaks = seq(0, 200, by = 20)) +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(x = paste0("Trial (bins of ", binsize, ")"),
+       y = "Response accuracy")
+```
+
+We can make the same plot but with the presentation count on the x-axis.
+A fact is generally not presented more than 10 times during a session:
+```{r}
+hist(count(d, subject, list, id)$n, 20)
+```
+
+This plot indicates that response accuracy is a bit lower on the third presentation in the post-march session.
+The first presentation is always a study trial, and the second presentation typically comes directly after.
+The third presentation comes later and is therefore an indication of how well the short-term information has been consolidated in long term memory.
+```{r}
+d %>%
+  group_by(subject, list, presentation) %>%
+  summarise(accuracy = mean(correct)) %>%
+  group_by(list, presentation) %>%
+  summarise(acc_se = sd(accuracy)/sqrt(n()),
+            acc = mean(accuracy)) %>%
+  ggplot(aes(x = presentation, y = acc, group = list, colour = list)) +
+  geom_ribbon(aes(ymin = acc - acc_se, ymax = acc + acc_se, fill = list), alpha = 0.2, colour = NA) +
+  geom_point() +
+  geom_line() +
+  scale_x_continuous(limits = c(1, 10), breaks = 1:10) +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(x = paste0("Presentation"),
+       y = "Response accuracy")
+```
+
+
+We can also plot accuracy as a function of time to see if there is a difference.
+
+```{r}
+binsize_time <- 30
+
+d %>%
+  group_by(subject, list) %>%
+  mutate(time = (start_time - min(start_time))/1000) %>%
+  ungroup() %>%
+  mutate(part = cut(time, seq(0, max(time) + 10, by = binsize_time), labels = F, include.lowest = TRUE) * binsize_time) %>%
+  group_by(subject, list, part) %>%
+  summarise(accuracy = mean(correct)) %>%
+  group_by(list, part) %>%
+  summarise(acc_se = sd(accuracy)/sqrt(n()),
+            acc = mean(accuracy)) %>%
+  ggplot(aes(x = (part - binsize_time/2)/60, y = acc, group = list, colour = list)) +
+  geom_ribbon(aes(ymin = acc - acc_se, ymax = acc + acc_se, fill = list), alpha = 0.2, colour = NA) +
+  geom_point() +
+  geom_line() +
+  scale_x_continuous(labels = scales::unit_format(unit = "min")) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  scale_colour_manual(values = colours_custom) +
+  scale_fill_manual(values = colours_custom) +
+  expand_limits(x = 8.0001) + # Avoid "8 min" label being cut off
+  labs(x = NULL,
+       y = NULL,
+       title = "Response accuracy over time (30-second bins)",
+       colour = NULL,
+       fill = NULL) +
+  theme_poster +
+  theme(legend.position = c(.915,0.15))
+
+ggsave("../output/acc_over_time.pdf", device = "pdf", width = 7, height = 3.5)
+```
+
+
+Let's model this.
+There is clearly a strong non-linear effect of time, which means that we'll have to use GAMs.
+```{r}
+d_gam <- d %>%
+  group_by(subject, list, id) %>%
+  mutate(time_since_introduced = (start_time - min(start_time))/1000) %>%
+  ungroup() %>%
+  group_by(subject, list) %>%
+  mutate(time = (start_time - min(start_time))/1000) %>%
+  ungroup() %>%
+  mutate_if(is.character, as.factor)
+```
+
+
+Fit a time smooth for each list.
+```{r}
+gam_acc0 <- bam(correct ~ list + s(time, by = list) + s(subject, bs = "re") + s(id, bs = "re"),
+               family = binomial,
+               data = d_gam)
+
+summary(gam_acc0)
+```
+
+This model already does OK, but it does not incorporate information about the learner's familiarity with each specific item.
+To address this, fit a model with an additional smooth for the time elapsed since the item was introduced, separately for each list.
+```{r}
+gam_acc1 <- bam(correct ~ list + s(time, by = list) + s(time_since_introduced, by = list) + s(subject, bs = "re") + s(id, bs = "re"),
+               family = binomial,
+               data = d_gam)
+
+summary(gam_acc1)
+```
+
+The second model is indeed preferred:
+```{r}
+compareML(gam_acc0, gam_acc1)
+```
+
+Also fit a model with only the time-since-introduced, for comparison.
+```{r}
+gam_acc2 <- bam(correct ~ list + s(time_since_introduced, by = list) + s(subject, bs = "re") + s(id, bs = "re"),
+               family = binomial,
+               data = d_gam)
+
+summary(gam_acc2)
+```
+
+And fit a model with a smooth for time plus a smooth for presentation count rather than time-since-introduced:
+```{r}
+gam_acc3 <- bam(correct ~ list + s(time, by = list) + s(presentation, by = list) + s(subject, bs = "re") + s(id, bs = "re"),
+               family = binomial,
+               data = d_gam)
+
+summary(gam_acc3)
+```
+
+The model with a smooth for time and an additional smooth for the presentation count performs best:
+```{r}
+compareML(gam_acc1, gam_acc2)
+compareML(gam_acc2, gam_acc3)
+```
+
+A model that combines all three smooths is overkill:
+```{r}
+gam_acc4 <- bam(correct ~ list + s(time, by = list) + s(time_since_introduced, by = list) + s(presentation, by = list) + s(subject, bs = "re") + s(id, bs = "re"),
+               family = binomial,
+               data = d_gam)
+
+summary(gam_acc4)
+```
+
+```{r}
+compareML(gam_acc3, gam_acc4)
+```
+
+Adding a random factor smooth over time instead of a random intercept for subjects improves the model:
+```{r}
+gam_acc5 <- bam(correct ~ list + s(time, by = list) + s(presentation, by = list) + s(time, subject, bs = "fs", m = 1) + s(id, bs = "re"),
+               family = binomial,
+               data = d_gam,
+               nthreads = 7)
+
+compareML(gam_acc3, gam_acc5)
+```
+
+Should we add another random factor smooth over presentation? Yes.
+```{r}
+gam_acc6 <- bam(correct ~ list + s(time, by = list) + s(presentation, by = list) + s(time, subject, bs = "fs", m = 1) + s(presentation, subject, bs = "fs", m = 1) + s(id, bs = "re"),
+                family = binomial,
+                data = d_gam,
+                nthreads = 7)
+
+compareML(gam_acc5, gam_acc6)
+```
+
+Also adding these random factor smooths for facts improves the model very slightly, but it takes forever to run and does not really make sense conceptually, so skip for now.
+```{r}
+# gam_acc7 <- bam(correct ~ list + s(time, by = list) + s(presentation, by = list) + s(time, subject, bs = "fs", m = 1) + s(presentation, subject, bs = "fs", m = 1) + s(time, id, bs = "fs", m = 1) + s(presentation, id, bs = "fs", m = 1),
+#                 family = binomial,
+#                 data = d_gam,
+#                 nthreads = 7)
+# 
+# compareML(gam_acc6, gam_acc7)
+```
+
+Best model:
+```{r}
+summary(gam_acc6)
+```
+
+```{r}
+fvisgam(gam_acc6, view = c("time", "presentation"), rm.ranef = TRUE, transform = plogis, ylim = c(0, 15))
+```
+
+
+
+The plot below shows the smooths over time for both sessions. 
+```{r}
+plot_smooth(gam_acc6, view = "time", plot_all = "list", rm.ranef = TRUE, transform = plogis)
+```
+
+There is a significant difference between pre-march and post-march accuracy at the start of the session:
+```{r}
+plot_diff(gam_acc6, view = "time", comp = list(list = c("after", "before")), rm.ranef = TRUE)
+```
+
+Conclusions:
+
+- The GAM shows an overall decrease in response accuracy from pre- to post-march (pre: `r plogis(sum(coef(gam_acc6)[1]))`; post: `r plogis(coef(gam_acc6)[1:2])`).
+- There is a significant difference in the effect of time on accuracy: accuracy is lower in the first few minutes in the post-march session.
+
+
+## Response time
+
+We can do a similar analysis for response time.
+The plot below shows average response time over the course of the session (we calculate the median RT per participant and then take the mean across participants).
+Study trials and trials with incorrect/missing responses are removed.
+The plot suggests that participants respond faster on correct trials after the speed march than before.
+```{r}
+binsize <- 10
+
+d %>%
+  mutate(part = cut(trial_index - 2, seq(0, max(trial_index) + 3, by = binsize), labels = F) * binsize) %>%
+  filter(study == FALSE) %>%
+  filter(correct) %>%
+  group_by(subject, list, part) %>%
+  summarise(rt = median(rt)) %>%
+  group_by(list, part) %>%
+  summarise(rt_se = sd(rt)/sqrt(n()),
+            rt = mean(rt)) %>%
+  ggplot(aes(x = part, y = rt, group = list, colour = list)) +
+  geom_ribbon(aes(ymin = rt - rt_se, ymax = rt + rt_se, fill = list), alpha = 0.2, colour = NA) +
+  geom_point() +
+  geom_line() +
+  scale_x_continuous(breaks = seq(0, 200, by = 20)) +
+  labs(x = paste0("Trial (bins of ", binsize, ")"),
+       y = "Response time (ms)")
+
+```
+
+We can make a similar plot with the presentation count on the x-axis.
+Study trials are included in this plot (presentation = 1), but incorrect/missing responses are again filtered out.
+This plot suggests that RT is consistently lower in the post-march session, particularly for the first few repetitions of an item.
+```{r}
+d %>%
+  # filter(study == FALSE) %>%
+  filter(correct) %>%
+  group_by(subject, list, presentation) %>%
+  summarise(rt = median(rt)) %>%
+  group_by(list, presentation) %>%
+  summarise(rt_se = sd(rt)/sqrt(n()),
+            rt = mean(rt)) %>%
+  ggplot(aes(x = presentation, y = rt, group = list, colour = list)) +
+  geom_ribbon(aes(ymin = rt - rt_se, ymax = rt + rt_se, fill = list), alpha = 0.2, colour = NA) +
+  geom_point() +
+  geom_line() +
+  scale_x_continuous(limits = c(1, 10), breaks = 1:10) +
+  labs(x = paste0("Presentation"),
+       y = "Response time (ms)")
+```
+
+A plot of RT over time (study trials and incorrect/missing trials filtered out) presents a similar view: responses are faster at the start of the post-march session.
+```{r}
+binsize_time <- 30
+
+d %>%
+  filter(study == FALSE) %>%
+  filter(correct) %>%
+  group_by(subject, list) %>%
+  mutate(time = (start_time - min(start_time))/1000) %>%
+  ungroup() %>%
+  mutate(part = cut(time, seq(0, max(time) + 10, by = binsize_time), labels = F, include.lowest = TRUE) * binsize_time) %>%
+  group_by(subject, list, part) %>%
+  summarise(rt = median(rt)) %>%
+  group_by(list, part) %>%
+  summarise(rt_se = sd(rt)/sqrt(n()),
+            rt = mean(rt)) %>%
+  ggplot(aes(x = part, y = rt, group = list, colour = list)) +
+  geom_ribbon(aes(ymin = rt - rt_se, ymax = rt + rt_se, fill = list), alpha = 0.2, colour = NA) +
+  geom_point() +
+  geom_line() +
+  labs(x = paste0("Time (s)"),
+       y = "Response time (ms)",
+       caption = "30-second bins")
+```
+
+```{r}
+binsize_time <- 30
+
+d %>%
+  filter(study == FALSE) %>%
+  filter(correct) %>%
+  group_by(subject, list) %>%
+  mutate(time = (start_time - min(start_time))/1000) %>%
+  ungroup() %>%
+  mutate(part = cut(time, seq(0, max(time) + 10, by = binsize_time), labels = F, include.lowest = TRUE) * binsize_time) %>%
+  group_by(subject, list, part) %>%
+  summarise(rt = median(rt)) %>%
+  group_by(list, part) %>%
+  summarise(rt_se = (sd(rt)/sqrt(n()) / 1000),
+            rt = mean(rt) / 1000) %>%
+  ggplot(aes(x = (part - binsize_time/2)/60, y = rt, group = list, colour = list)) +
+  geom_ribbon(aes(ymin = rt - rt_se, ymax = rt + rt_se, fill = list), alpha = 0.2, colour = NA) +
+  geom_point() +
+  geom_line() +
+  scale_x_continuous(labels = scales::unit_format(unit = "min")) +
+  scale_y_continuous(labels = scales::unit_format(accuracy = .1, unit = "s")) +
+  scale_colour_manual(values = colours_custom) +
+  scale_fill_manual(values = colours_custom) +
+  expand_limits(x = 8.0001) + # Avoid "8 min" label being cut off
+  labs(x = NULL,
+       y = NULL,
+       title = "Response time over time (30-second bins)",
+       colour = NULL,
+       fill = NULL) +
+  theme_poster +
+  theme(legend.position = c(.915,0.15))
+
+ggsave("../output/rt_over_time.pdf", device = "pdf", width = 7, height = 3.5)
+```
+
+
+
+# Conclusions
+
+The effects of the speed march on performance in the fact learning task are as follows:
+
+- Participants completed 6 more trials in the post-march session.
+- Participants encountered 1.5 more facts in the post-march session.
+- Average response accuracy was the same between sessions (though accuracy was lower post-march at the start of the session).
+- Response times were about 350 ms faster after the speed march (again, this effect seems to occur primarily at the start of the session).  
+- There was a small difference in final rate of forgetting estimates pre- and post-march, with post-march estimates being a bit lower.
