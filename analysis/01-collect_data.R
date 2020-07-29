@@ -36,39 +36,17 @@ collate_data <- function(files, date_label) {
     ungroup()
 }
 
-
-anonymise_ids <- function(dat) {
-  dat %>%
-    left_join(auto_to_auth0, by = c("subject" = "auto_id")) %>%
-    mutate(subject = ifelse(is.na(auth0_id), subject, auth0_id)) %>%
-    select(-auth0_id) %>%
-    select(subject, list, city, trial_index, start_time, everything())
-}
-
 auto_to_auth0 <- read_csv(file.path(dir_raw_202001, "auto_to_auth0.csv"))
 
 # Learning sessions -------------------------------------------------------
 
 # Each learning session has a CSV file with "safehouses" in its name
 files_learn_201909 <- list.files(dir_raw_201909, "safehouses", full.names = TRUE)
-files_learn_202001 <- list.files(dir_raw_202001, "safehouses", full.names = TRUE)
-
 learn_201909 <- collate_data(files_learn_201909, "201909")
-learn_202001 <- collate_data(files_learn_202001, "202001")
-
-
-# Tests -------------------------------------------------------------------
-
-# Each test has a CSV file with "toets" in its name
-files_test_201909 <- list.files(dir_raw_201909, "toets", full.names = TRUE)
-# No tests were done in 202001
-
-test_201909 <- collate_data(files_test_201909, "201909") 
-
 
 # Replace subject tokens with anonymised IDs ------------------------------
 
-subjects <- bind_rows(learn_201909, learn_202001, test_201909) %>%
+subjects <- learn_201909 %>%
   distinct(subject) %>%
   left_join(auto_to_auth0, by = c("subject" = "auto_id")) %>%
   mutate(subject = ifelse(is.na(auth0_id), subject, auth0_id)) %>%
@@ -77,16 +55,12 @@ subjects <- bind_rows(learn_201909, learn_202001, test_201909) %>%
          subj = fct_anon(subject, prefix = "subj"),
          subject = as.character(subject))
 
-
-learn_201909 <- anonymise_ids(learn_201909)
-learn_202001 <- anonymise_ids(learn_202001)
-test_201909 <- anonymise_ids(test_201909)
-
+learn_201909 <- left_join(learn_201909, subjects, by = "subject") %>%
+  mutate(subject = subj) %>%
+  select(-subj)
 
 # Export to CSV -----------------------------------------------------------
 
 write_csv(learn_201909, file.path(dir_processed, "learn_201909.csv"))
-write_csv(learn_202001, file.path(dir_processed, "learn_202001.csv"))
-write_csv(test_201909, file.path(dir_processed, "test_201909.csv"))
 
 write_csv(subjects, file.path(dir_processed, "subject_IDs.csv"))
